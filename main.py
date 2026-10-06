@@ -7,10 +7,11 @@ Then open in a browser:     http://127.0.0.1:8000/docs
 Endpoints
   GET /                          is the API running? what model is loaded?
   GET /predict?lag_1=..&lag_2=.. predict from two prices you type in
-  GET /predict/live?symbol=TSLA  fetch the latest prices from Alpha Vantage, then predict
+  GET /predict/live?symbol=TSLA  fetch the latest prices from Finnhub, then predict
 """
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import joblib
 import pandas as pd
@@ -38,6 +39,36 @@ def predict_next(lag_1: float, lag_2: float) -> float:
     return round(float(model.predict(X)[0]), 2)
 
 
+def finnhub_get(endpoint: str, params: dict) -> dict:
+    key = os.environ.get("FINNHUB_API_KEY")
+    if not key:
+        raise HTTPException(status_code=500, detail="FINNHUB_API_KEY is not set on the server.")
+
+    try:
+        response = requests.get(
+            f"https://finnhub.io/api/v1/{endpoint}",
+            params={**params, "token": key},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Finnhub request failed: {exc}") from exc
+
+    try:
+        reply = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Finnhub returned an invalid response.") from exc
+
+    if not response.ok:
+        message = reply.get("error", "Finnhub request failed.") if isinstance(reply, dict) else "Finnhub request failed."
+        raise HTTPException(status_code=502, detail=message)
+    if not isinstance(reply, dict):
+        raise HTTPException(status_code=502, detail="Finnhub returned an unexpected response.")
+    if reply.get("error"):
+        raise HTTPException(status_code=502, detail=reply["error"])
+
+    return reply
+
+
 @app.get("/")
 def home():
     return {"message": "The API is running. Open /docs to try it.", **info}
@@ -56,64 +87,53 @@ def predict(lag_1: float, lag_2: float):
 
 @app.get("/search")
 def search_symbol(keywords: str):
-    """Search Alpha Vantage for stock symbols matching a company keyword."""
-    key = os.environ.get("ALPHAVANTAGE_KEY")
-    if not key:
-        raise HTTPException(status_code=500, detail="ALPHAVANTAGE_KEY is not set on the server.")
-
-    reply = requests.get(
-        "https://www.alphavantage.co/query",
-        params={"function": "SYMBOL_SEARCH", "keywords": keywords, "apikey": key},
-        timeout=15,
-    ).json()
-
-    matches = reply.get("bestMatches") or []
-    if not matches:
-        message = reply if "bestMatches" not in reply else f"No symbols found for '{keywords}'."
-        raise HTTPException(status_code=404, detail=message)
-
-    cleaned = []
-    for match in matches:
-        cleaned.append({
-            "symbol": match.get("1. symbol"),
-            "name": match.get("2. name"),
-            "type": match.get("3. type"),
-            "region": match.get("4. region"),
-            "market_open": match.get("5. marketOpen"),
-            "market_close": match.get("6. marketClose"),
-            "timezone": match.get("7. timezone"),
-            "currency": match.get("8. currency"),
-            "match_score": match.get("9. matchScore"),
-        })
-
+    """Search Finnhub for stock symbols matching a company keyword."""
+    reply = finnhub_get("search", {"q": keywords})
+    matches = reply.get("result") or []
+    cleaned = [
+        {
+            "symbol": match.get("symbol") or match.get("displaySymbol"),
+            "name": match.get("description"),
+            "type": match.get("type"),
+        }
+        for match in matches
+        if isinstance(match, dict)
+    ]
     return {"keywords": keywords, "matches": cleaned}
 
 
 @app.get("/predict/live")
 def predict_live(symbol: str = "TSLA"):
-    """Get the latest two closes from Alpha Vantage, then predict the next one."""
-    key = os.environ.get("ALPHAVANTAGE_KEY")
-    if not key:
-        raise HTTPException(status_code=500, detail="ALPHAVANTAGE_KEY is not set on the server.")
+    """Get the latest two daily closes from Finnhub, then predict the next one."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=14)
+    reply = finnhub_get(
+        "stock/candle",
+        {
+            "symbol": symbol,
+            "resolution": "D",
+            "from": int(start.timestamp()),
+            "to": int(end.timestamp()),
+        },
+    )
 
-    reply = requests.get(
-        "https://www.alphavantage.co/query",
-        params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": key},
-        timeout=15,
-    ).json()
+    closes = reply.get("c")
+    timestamps = reply.get("t")
+    if reply.get("s") != "ok" or not isinstance(closes, list) or not isinstance(timestamps, list):
+        raise HTTPException(status_code=502, detail=f"Finnhub returned no daily candles for '{symbol}'.")
+    if len(closes) < 2 or len(timestamps) != len(closes):
+        raise HTTPException(status_code=502, detail=f"Finnhub returned fewer than two daily closes for '{symbol}'.")
 
-    quote = reply.get("Global Quote")
-    if not quote:
-        # Alpha Vantage answered with a message (bad key, daily limit, unknown symbol...).
-        # We pass it on with a proper error status code.
-        message = reply if "Global Quote" not in reply else f"No quote found for symbol '{symbol}'."
-        raise HTTPException(status_code=502, detail=message)
+    try:
+        last_close = float(closes[-1])
+        previous_close = float(closes[-2])
+        latest_trading_day = datetime.fromtimestamp(timestamps[-1], timezone.utc).date().isoformat()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=502, detail="Finnhub returned invalid daily candle data.") from exc
 
-    last_close = float(quote["05. price"])
-    previous_close = float(quote["08. previous close"])
     return {
-        "symbol": quote["01. symbol"],
-        "latest_trading_day": quote["07. latest trading day"],
+        "symbol": symbol.upper(),
+        "latest_trading_day": latest_trading_day,
         "last_close": last_close,
         "previous_close": previous_close,
         "predicted_next_close": predict_next(last_close, previous_close),
