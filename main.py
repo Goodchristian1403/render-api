@@ -10,8 +10,9 @@ Endpoints
   GET /predict/live?symbol=TSLA  fetch the latest prices from Finnhub, then predict
 """
 import json
+import math
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import joblib
 import pandas as pd
@@ -104,32 +105,18 @@ def search_symbol(keywords: str):
 
 @app.get("/predict/live")
 def predict_live(symbol: str = "TSLA"):
-    """Get the latest two daily closes from Finnhub, then predict the next one."""
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=14)
-    reply = finnhub_get(
-        "stock/candle",
-        {
-            "symbol": symbol,
-            "resolution": "D",
-            "from": int(start.timestamp()),
-            "to": int(end.timestamp()),
-        },
-    )
-
-    closes = reply.get("c")
-    timestamps = reply.get("t")
-    if reply.get("s") != "ok" or not isinstance(closes, list) or not isinstance(timestamps, list):
-        raise HTTPException(status_code=502, detail=f"Finnhub returned no daily candles for '{symbol}'.")
-    if len(closes) < 2 or len(timestamps) != len(closes):
-        raise HTTPException(status_code=502, detail=f"Finnhub returned fewer than two daily closes for '{symbol}'.")
+    """Use Finnhub's latest quote and previous close to predict the next close."""
+    reply = finnhub_get("quote", {"symbol": symbol})
 
     try:
-        last_close = float(closes[-1])
-        previous_close = float(closes[-2])
-        latest_trading_day = datetime.fromtimestamp(timestamps[-1], timezone.utc).date().isoformat()
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise HTTPException(status_code=502, detail="Finnhub returned invalid daily candle data.") from exc
+        last_close = float(reply["c"])
+        previous_close = float(reply["pc"])
+        quote_timestamp = int(reply["t"])
+        latest_trading_day = datetime.fromtimestamp(quote_timestamp, timezone.utc).date().isoformat()
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=502, detail=f"Finnhub returned invalid quote data for '{symbol}'.") from exc
+    if not math.isfinite(last_close) or not math.isfinite(previous_close) or last_close <= 0 or previous_close <= 0:
+        raise HTTPException(status_code=502, detail=f"Finnhub returned no usable quote data for '{symbol}'.")
 
     return {
         "symbol": symbol.upper(),
