@@ -3,7 +3,7 @@ import os
 import requests
 import streamlit as st
 
-API_URL = os.getenv("API_URL", "https://render-api-2y5x.onrender.com")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
 st.set_page_config(page_title="Stock Prediction", page_icon="📈", layout="wide")
 st.title("Stock Price Prediction")
@@ -18,7 +18,7 @@ try:
 except requests.RequestException as exc:
     st.sidebar.warning(f"Could not reach API: {exc}")
 
-manual_tab, live_tab = st.tabs(["Manual inputs", "Live symbol data"])
+manual_tab, live_tab, search_tab = st.tabs(["Manual inputs", "Live symbol data", "Search symbols"])
 
 with manual_tab:
     lag_1 = st.number_input("Latest close", value=100.0, step=0.01)
@@ -66,3 +66,45 @@ with live_tab:
                 st.json(data)
         except requests.RequestException as exc:
             st.error(f"Live prediction request failed: {exc}")
+
+with search_tab:
+    keyword = st.text_input("Search company keyword", value="apple")
+
+    if st.button("Search symbols"):
+        try:
+            response = requests.get(
+                f"{api_url}/search",
+                params={"keywords": keyword},
+                timeout=20,
+            )
+            if response.status_code >= 400:
+                detail = response.json().get("detail", response.text)
+                st.error(f"Symbol search failed ({response.status_code}): {detail}")
+            else:
+                data = response.json()
+                matches = data.get("matches", [])
+                st.subheader(f"Matches for '{data.get('keywords', keyword)}'")
+
+                if not matches:
+                    st.info("No matching symbols were found.")
+                else:
+                    for match in matches[:10]:
+                        with st.container():
+                            st.markdown(
+                                f"**{match['symbol']}** — {match['name']} "
+                                f"({match.get('currency', 'N/A')}, {match.get('region', 'N/A')})"
+                            )
+                            st.caption(
+                                f"Type: {match.get('type', 'N/A')} | "
+                                f"Market: {match.get('market_open', 'N/A')} - {match.get('market_close', 'N/A')} | "
+                                f"Match score: {match.get('match_score', 'N/A')}"
+                            )
+                            if st.button(f"Use {match['symbol']}", key=f"symbol_{match['symbol']}"):
+                                st.session_state["selected_symbol"] = match["symbol"]
+                                st.success(f"Selected symbol: {match['symbol']}")
+
+                    if "selected_symbol" in st.session_state:
+                        st.markdown(f"Selected ticker: **{st.session_state['selected_symbol']}**")
+                        st.code(f"Use this in the live prediction tab: {st.session_state['selected_symbol']}")
+        except requests.RequestException as exc:
+            st.error(f"Symbol search request failed: {exc}")

@@ -54,6 +54,41 @@ def predict(lag_1: float, lag_2: float):
     }
 
 
+@app.get("/search")
+def search_symbol(keywords: str):
+    """Search Alpha Vantage for stock symbols matching a company keyword."""
+    key = os.environ.get("ALPHAVANTAGE_KEY")
+    if not key:
+        raise HTTPException(status_code=500, detail="ALPHAVANTAGE_KEY is not set on the server.")
+
+    reply = requests.get(
+        "https://www.alphavantage.co/query",
+        params={"function": "SYMBOL_SEARCH", "keywords": keywords, "apikey": key},
+        timeout=15,
+    ).json()
+
+    matches = reply.get("bestMatches") or []
+    if not matches:
+        message = reply if "bestMatches" not in reply else f"No symbols found for '{keywords}'."
+        raise HTTPException(status_code=404, detail=message)
+
+    cleaned = []
+    for match in matches:
+        cleaned.append({
+            "symbol": match.get("1. symbol"),
+            "name": match.get("2. name"),
+            "type": match.get("3. type"),
+            "region": match.get("4. region"),
+            "market_open": match.get("5. marketOpen"),
+            "market_close": match.get("6. marketClose"),
+            "timezone": match.get("7. timezone"),
+            "currency": match.get("8. currency"),
+            "match_score": match.get("9. matchScore"),
+        })
+
+    return {"keywords": keywords, "matches": cleaned}
+
+
 @app.get("/predict/live")
 def predict_live(symbol: str = "TSLA"):
     """Get the latest two closes from Alpha Vantage, then predict the next one."""
